@@ -1,0 +1,7 @@
+input: /Volumes/SSDSlow/20251209_10x_Ti2_LNP_HuH7.nd2
+output_dir: ~/Documents
+exports:
+  - output: a.tif
+    pos: 0
+  - output: b.tif
+    pos: 1

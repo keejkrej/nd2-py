@@ -218,14 +218,25 @@ def parse_info_dict(
     }
 
 
-def parse_range(range_str: str | None) -> tuple[int, int] | None:
-    """Parse a range string like '0-2' or '1' into a tuple (start, end)."""
+def parse_range(range_val: str | int | None) -> tuple[int, int] | None:
+    """Parse a range like '0-2', '1', or 1 into a tuple (start, end)."""
+    if range_val is None:
+        return None
+    if isinstance(range_val, int):
+        return (range_val, range_val)
+    if not isinstance(range_val, str):
+        return None
+
+    range_str = range_val.strip()
     if not range_str:
         return None
     if "-" in range_str:
         parts = range_str.split("-")
         if len(parts) == 2:
-            return (int(parts[0]), int(parts[1]))
+            try:
+                return (int(parts[0]), int(parts[1]))
+            except ValueError:
+                return None
     try:
         val = int(range_str)
         return (val, val)

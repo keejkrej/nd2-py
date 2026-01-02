@@ -30,6 +30,7 @@ def info(
     file_path: str = typer.Argument(..., help="Path to the ND2 file"),
 ) -> None:
     """Display information about an ND2 file."""
+    file_path = os.path.expanduser(file_path)
     if not os.path.exists(file_path):
         console.print(f"[red]Error: File not found: {file_path}[/red]")
         raise typer.Exit(1)
@@ -143,9 +144,17 @@ def info(
 
 @app.command()
 def export(
-    input_path: str = typer.Option(..., "--input", "-i", help="Path to the ND2 file"),
-    output_path: str = typer.Option(
-        ..., "--output", "-o", help="Path to the output TIFF file"
+    input_path: str | None = typer.Option(
+        None, "--input", "-i", help="Path to the ND2 file"
+    ),
+    output_path: str | None = typer.Option(
+        None, "--output", "-o", help="Path to the output TIFF file"
+    ),
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        "-g",
+        help="Path to a YAML or JSON config file for batch export",
     ),
     position: str | None = typer.Option(
         None, "--pos", "-p", help="Position range (e.g., '0-2' or '0')"
@@ -155,44 +164,133 @@ def export(
     z: str | None = typer.Option(None, "--z", "-z", help="Z-slice range"),
 ) -> None:
     """Export ND2 to TIFF with selected ranges."""
-    if not os.path.exists(input_path):
-        console.print(f"[red]Error: Input file not found: {input_path}[/red]")
+    from .logic import batch_export_tiff, load_export_config
+
+    if config:
+        try:
+            cfg_data = load_export_config(config)
+        except Exception as e:
+            console.print(f"[red]Error loading config: {e}[/red]")
+            raise typer.Exit(1)
+
+        input_file = cfg_data.get("input")
+        output_dir = cfg_data.get("output_dir")
+        tasks = cfg_data.get("exports", [])
+        is_batch_mode = True
+    else:
+        if not input_path or not output_path:
+            console.print(
+                "[red]Error: Both --input and --output are required "
+                "unless --config is used.[/red]"
+            )
+            raise typer.Exit(1)
+
+        input_file = input_path
+        output_dir = os.path.dirname(output_path)
+        tasks = [
+            {
+                "output": os.path.basename(output_path),
+                "pos": position,
+                "chan": channel,
+                "time": time,
+                "z": z,
+            }
+        ]
+        is_batch_mode = False
+        cfg_data = {
+            "input": input_file,
+            "output_dir": output_dir,
+            "exports": tasks,
+        }
+
+    if not input_file:
+        console.print("[red]Error: Missing input file path.[/red]")
+        raise typer.Exit(1)
+    if not tasks:
+        console.print("[yellow]No export tasks found.[/yellow]")
+        return
+
+    input_file = os.path.expanduser(input_file)
+    if not os.path.exists(input_file):
+        console.print(f"[red]Error: Input file not found: {input_file}[/red]")
         raise typer.Exit(1)
 
-    pos_range = parse_range(position)
-    chan_range = parse_range(channel)
-    time_range = parse_range(time)
-    z_range = parse_range(z)
+    # Display Summary
+    display_text = ""
+    if is_batch_mode:
+        display_text += f"[bold blue]Config:[/bold blue] {config}\n"
+    display_text += f"[bold blue]Input:[/bold blue] {input_file}"
+    if output_dir:
+        display_text += (
+            f"\n[bold blue]Output Dir:[/bold blue] {os.path.expanduser(output_dir)}"
+        )
 
-    console.print(f"[yellow]Exporting:[/yellow] {input_path} -> {output_path}")
+    console.print(
+        Panel(display_text, title="Batch Export" if is_batch_mode else "Export")
+    )
 
+    table = Table(title="Export Tasks")
+    table.add_column("#", style="dim")
+    table.add_column("Output", style="green")
+    table.add_column("Pos", style="magenta")
+    table.add_column("Chan", style="magenta")
+    table.add_column("Time", style="magenta")
+    table.add_column("Z", style="magenta")
+
+    for i, t in enumerate(tasks):
+        table.add_row(
+            str(i + 1),
+            str(t.get("output")),
+            str(t.get("pos", "-") if t.get("pos") is not None else "-"),
+            str(t.get("chan", "-") if t.get("chan") is not None else "-"),
+            str(t.get("time", "-") if t.get("time") is not None else "-"),
+            str(t.get("z", "-") if t.get("z") is not None else "-"),
+        )
+    console.print(table)
+
+    if not typer.confirm("Proceed with export?", default=True):
+        console.print("[yellow]Aborted.[/yellow]")
+        return
+
+    _run_export(batch_export_tiff, config=cfg_data)
+
+
+def _run_export(func: Any, **kwargs: Any) -> None:
+    """Helper to run export with progress reporting."""
+    from .logic import export_tiff
+
+    is_batch = func != export_tiff
     signals = ND2Signals()
     err_container: list[str] = []
     signals.error.connect(lambda msg: err_container.append(msg))
 
-    # Proxy for the per-frame progress bar
     active_progress: Progress | None = None
 
-    def proxy_wrapper(iterable: Any) -> Any:
+    def proxy_wrapper(iterable: Any, description: str | None = None) -> Any:
         import time
 
-        # Small wait to ensure the UI has switched to Phase 2
-        for _ in range(40):
+        if description is None:
+            out = kwargs.get("output_path")
+            description = (
+                f"Exporting {os.path.basename(out)}..."
+                if out
+                else "Processing frames..."
+            )
+
+        # Wait for the UI to switch to Phase 2 (Progress Bar)
+        for _ in range(100):
             if active_progress:
                 break
-            time.sleep(0.05)
+            time.sleep(0.01)
 
         if active_progress:
-            task_id = active_progress.add_task(
-                "Processing frames...", total=len(iterable)
-            )
+            tid = active_progress.add_task(description, total=len(iterable))
             for item in iterable:
                 yield item
-                active_progress.update(task_id, advance=1)
+                active_progress.update(tid, advance=1)
         else:
             yield from iterable
 
-    # Phase 1: Metadata Loading (Throbber)
     current_progress = 0
 
     def update_progress(val: int) -> None:
@@ -201,24 +299,17 @@ def export(
 
     signals.progress.connect(update_progress)
 
+    kwargs["signals"] = signals
+    kwargs["progress_wrapper"] = proxy_wrapper
+
     with console.status("[bold green]Loading metadata..."):
-        thread = threading.Thread(
-            target=export_tiff,
-            kwargs={
-                "nd2_path": input_path,
-                "output_path": output_path,
-                "position": pos_range,
-                "channel": chan_range,
-                "time": time_range,
-                "z": z_range,
-                "signals": signals,
-                "progress_wrapper": proxy_wrapper,
-            },
-        )
+        thread = threading.Thread(target=func, kwargs=kwargs)
         thread.start()
 
-        while thread.is_alive() and current_progress < 40:
-            thread.join(0.1)
+        # Transition to progress bar UI as soon as we have any progress
+        threshold = 5
+        while thread.is_alive() and current_progress < threshold:
+            thread.join(0.05)
             if err_container:
                 break
 
@@ -226,7 +317,6 @@ def export(
         console.print(f"[bold red]Export failed: {err_container[0]}[/bold red]")
         raise typer.Exit(1)
 
-    # Phase 2: Data Extraction (Progress Bar)
     if thread.is_alive():
         with Progress(
             SpinnerColumn(),
@@ -237,26 +327,19 @@ def export(
             console=console,
         ) as progress:
             active_progress = progress
-            main_task = progress.add_task(
-                "Exporting data...", total=100, completed=current_progress
-            )
+            # No overall progress bar as requested, only individual task bars
             signals.progress.disconnect(update_progress)
-            signals.progress.connect(
-                lambda val: progress.update(main_task, completed=val)
-            )
 
-            # Wait for completion
             while thread.is_alive():
-                thread.join(0.1)
+                thread.join(0.05)
     else:
-        # It might have finished very quickly
         pass
 
     if err_container:
         console.print(f"[bold red]Export failed: {err_container[0]}[/bold red]")
         raise typer.Exit(1)
 
-    console.print(f"[bold green]Successfully exported to {output_path}[/bold green]")
+    console.print("[bold green]Export complete.[/bold green]")
 
 
 def main() -> None:
