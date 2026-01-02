@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any
 
 import typer
@@ -16,56 +17,12 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from ._core import SignalsInterface, WorkerSignal
-from ._processors import ND2ProcessorLogic, TiffExportLogic
+from .logic import export_tiff, load_nd2
+from .signals import ND2Signals
+from .utils import format_unit, format_value, parse_range
 
 app = typer.Typer(help="ND2 Utilities CLI", no_args_is_help=True)
 console = Console()
-
-
-class RichSignal(WorkerSignal):
-    def emit(self, *args: Any) -> None:
-        pass
-
-
-class RichSignals(SignalsInterface):
-    def __init__(self) -> None:
-        self.progress = RichSignal()
-        self.finished = RichSignal()
-        self.error = RichSignal()
-
-
-def parse_range(range_str: str | None) -> tuple[int, int] | None:
-    if not range_str:
-        return None
-    if "-" in range_str:
-        parts = range_str.split("-")
-        if len(parts) == 2:
-            return (int(parts[0]), int(parts[1]))
-    try:
-        val = int(range_str)
-        return (val, val)
-    except ValueError:
-        return None
-
-
-def _fmt_val(val: Any) -> str:
-    if hasattr(val, "value"):
-        val = val.value
-    if isinstance(val, float):
-        return f"{val:.4f}".rstrip("0").rstrip(".")
-    return str(val)
-
-
-def _fmt_unit(unit: Any) -> str:
-    s = str(unit).split(".")[-1].lower()
-    mapping = {
-        "micrometer": "µm",
-        "nanometer": "nm",
-        "millisecond": "ms",
-        "second": "s",
-    }
-    return mapping.get(s, s)
 
 
 @app.command()
@@ -79,10 +36,26 @@ def info(
 
     with console.status("[bold green]Loading metadata..."):
         try:
-            info_dict = ND2ProcessorLogic.load(file_path)
+            result: dict[str, Any] = {}
+            error: list[str] = []
+
+            def target() -> None:
+                try:
+                    result.update(load_nd2(file_path))
+                except Exception as e:
+                    error.append(str(e))
+
+            thread = threading.Thread(target=target)
+            thread.start()
+            thread.join()
+
+            if error:
+                raise Exception(error[0])
+
+            info_dict = result
         except Exception as e:
             console.print(f"[red]Error loading file: {e}[/red]")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from e
 
     console.print(Panel(f"[bold blue]File:[/bold blue] {file_path}", title="ND2 Info"))
 
@@ -99,7 +72,6 @@ def info(
     ome = info_dict.get("ome_metadata")
     if ome and ome.images:
         try:
-            # Show summary from the first image
             img0 = ome.images[0]
             px0 = img0.pixels
 
@@ -107,19 +79,28 @@ def info(
             summary_table.add_column("Property", style="cyan")
             summary_table.add_column("Value", style="magenta")
 
-            summary_table.add_row("Pixel Type", _fmt_val(px0.type))
+            summary_table.add_row("Pixel Type", format_value(px0.type))
             summary_table.add_row(
                 "Physical Size X",
-                f"{_fmt_val(px0.physical_size_x)} {_fmt_unit(px0.physical_size_x_unit)}",
+                (
+                    f"{format_value(px0.physical_size_x)} "
+                    f"{format_unit(px0.physical_size_x_unit)}"
+                ),
             )
             summary_table.add_row(
                 "Physical Size Y",
-                f"{_fmt_val(px0.physical_size_y)} {_fmt_unit(px0.physical_size_y_unit)}",
+                (
+                    f"{format_value(px0.physical_size_y)} "
+                    f"{format_unit(px0.physical_size_y_unit)}"
+                ),
             )
             if px0.physical_size_z:
                 summary_table.add_row(
                     "Physical Size Z",
-                    f"{_fmt_val(px0.physical_size_z)} {_fmt_unit(px0.physical_size_z_unit)}",
+                    (
+                        f"{format_value(px0.physical_size_z)} "
+                        f"{format_unit(px0.physical_size_z_unit)}"
+                    ),
                 )
 
             if img0.acquisition_date:
@@ -128,7 +109,6 @@ def info(
             summary_table.add_row("Series Count", str(len(ome.images)))
             console.print(summary_table)
 
-            # Channel info from the first image
             if px0.channels:
                 chan_ome_table = Table(title="OME Channels")
                 chan_ome_table.add_column("Index", style="cyan")
@@ -146,7 +126,8 @@ def info(
                         ):
                             color = f"#{color}"
                     ems = (
-                        f"{_fmt_val(ch.emission_wavelength)} {_fmt_unit(ch.emission_wavelength_unit)}"
+                        f"{format_value(ch.emission_wavelength)} "
+                        f"{format_unit(ch.emission_wavelength_unit)}"
                         if ch.emission_wavelength
                         else "-"
                     )
@@ -185,52 +166,101 @@ def export(
 
     console.print(f"[yellow]Exporting:[/yellow] {input_path} -> {output_path}")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        main_task = progress.add_task("Preparing export...", total=100)
+    signals = ND2Signals()
+    err_container: list[str] = []
+    signals.error.connect(lambda msg: err_container.append(msg))
 
-        def signals_progress_emit(val: int) -> None:
-            progress.update(main_task, completed=val)
+    # Proxy for the per-frame progress bar
+    active_progress: Progress | None = None
 
-        class Signals:
-            def __init__(self) -> None:
-                self.progress = type("obj", (object,), {"emit": signals_progress_emit})
-                self.finished = type("obj", (object,), {"emit": lambda x: None})
-                self.error = type(
-                    "obj",
-                    (object,),
-                    {"emit": lambda x: console.print(f"[red]{x}[/red]")},
-                )
+    def proxy_wrapper(iterable: Any) -> Any:
+        import time
 
-        def rich_wrapper(iterable: Any) -> Any:
-            return progress.track(iterable, description="Extracting data...")
+        # Small wait to ensure the UI has switched to Phase 2
+        for _ in range(40):
+            if active_progress:
+                break
+            time.sleep(0.05)
 
-        try:
-            TiffExportLogic.export(
-                nd2_path=input_path,
-                output_path=output_path,
-                position=pos_range,
-                channel=chan_range,
-                time=time_range,
-                z=z_range,
-                signals=Signals(),  # type: ignore
-                progress_wrapper=rich_wrapper,
+        if active_progress:
+            task_id = active_progress.add_task(
+                "Processing frames...", total=len(iterable)
             )
-            console.print(
-                f"[bold green]Successfully exported to {output_path}[/bold green]"
+            for item in iterable:
+                yield item
+                active_progress.update(task_id, advance=1)
+        else:
+            yield from iterable
+
+    # Phase 1: Metadata Loading (Throbber)
+    current_progress = 0
+
+    def update_progress(val: int) -> None:
+        nonlocal current_progress
+        current_progress = val
+
+    signals.progress.connect(update_progress)
+
+    with console.status("[bold green]Loading metadata..."):
+        thread = threading.Thread(
+            target=export_tiff,
+            kwargs={
+                "nd2_path": input_path,
+                "output_path": output_path,
+                "position": pos_range,
+                "channel": chan_range,
+                "time": time_range,
+                "z": z_range,
+                "signals": signals,
+                "progress_wrapper": proxy_wrapper,
+            },
+        )
+        thread.start()
+
+        while thread.is_alive() and current_progress < 40:
+            thread.join(0.1)
+            if err_container:
+                break
+
+    if err_container:
+        console.print(f"[bold red]Export failed: {err_container[0]}[/bold red]")
+        raise typer.Exit(1)
+
+    # Phase 2: Data Extraction (Progress Bar)
+    if thread.is_alive():
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            active_progress = progress
+            main_task = progress.add_task(
+                "Exporting data...", total=100, completed=current_progress
             )
-        except Exception as e:
-            console.print(f"[bold red]Export failed: {e}[/bold red]")
-            raise typer.Exit(1)
+            signals.progress.disconnect(update_progress)
+            signals.progress.connect(
+                lambda val: progress.update(main_task, completed=val)
+            )
+
+            # Wait for completion
+            while thread.is_alive():
+                thread.join(0.1)
+    else:
+        # It might have finished very quickly
+        pass
+
+    if err_container:
+        console.print(f"[bold red]Export failed: {err_container[0]}[/bold red]")
+        raise typer.Exit(1)
+
+    console.print(f"[bold green]Successfully exported to {output_path}[/bold green]")
 
 
 def main() -> None:
+    """Run the ND2 CLI application."""
     app()
 
 
