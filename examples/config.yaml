@@ -1,7 +1,11 @@
 input: /Volumes/SSDSlow/20251209_10x_Ti2_LNP_HuH7.nd2
 output_dir: ~/Documents
 exports:
-  - output: a.tif
+  - output: q20_onpattro.tif
     pos: 0
-  - output: b.tif
-    pos: 1
+  - output: q20_huh7opt.tif
+    pos: 27
+  - output: ibitreat_onpattro.tif
+    pos: 98
+  - output: ibitreat_huh7opt.tif
+    pos: 63
