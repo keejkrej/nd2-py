@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 
 import typer
@@ -17,9 +18,9 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .logic import export_tiff, load_nd2
+from .logic import batch_export_tiff, load_export_config, load_nd2
 from .signals import ND2Signals
-from .utils import format_unit, format_value, parse_range
+from .utils import format_unit, format_value
 
 app = typer.Typer(help="ND2 Utilities CLI", no_args_is_help=True)
 console = Console()
@@ -164,19 +165,16 @@ def export(
     z: str | None = typer.Option(None, "--z", "-z", help="Z-slice range"),
 ) -> None:
     """Export ND2 to TIFF with selected ranges."""
-    from .logic import batch_export_tiff, load_export_config
-
     if config:
         try:
             cfg_data = load_export_config(config)
         except Exception as e:
             console.print(f"[red]Error loading config: {e}[/red]")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from e
 
         input_file = cfg_data.get("input")
         output_dir = cfg_data.get("output_dir")
         tasks = cfg_data.get("exports", [])
-        is_batch_mode = True
     else:
         if not input_path or not output_path:
             console.print(
@@ -196,7 +194,6 @@ def export(
                 "z": z,
             }
         ]
-        is_batch_mode = False
         cfg_data = {
             "input": input_file,
             "output_dir": output_dir,
@@ -217,7 +214,7 @@ def export(
 
     # Display Summary
     display_text = ""
-    if is_batch_mode:
+    if config:
         display_text += f"[bold blue]Config:[/bold blue] {config}\n"
     display_text += f"[bold blue]Input:[/bold blue] {input_file}"
     if output_dir:
@@ -225,9 +222,7 @@ def export(
             f"\n[bold blue]Output Dir:[/bold blue] {os.path.expanduser(output_dir)}"
         )
 
-    console.print(
-        Panel(display_text, title="Batch Export" if is_batch_mode else "Export")
-    )
+    console.print(Panel(display_text, title="Export"))
 
     table = Table(title="Export Tasks")
     table.add_column("#", style="dim")
@@ -252,14 +247,11 @@ def export(
         console.print("[yellow]Aborted.[/yellow]")
         return
 
-    _run_export(batch_export_tiff, config=cfg_data)
+    _run_export(config=cfg_data)
 
 
-def _run_export(func: Any, **kwargs: Any) -> None:
+def _run_export(**kwargs: Any) -> None:
     """Helper to run export with progress reporting."""
-    from .logic import export_tiff
-
-    is_batch = func != export_tiff
     signals = ND2Signals()
     err_container: list[str] = []
     signals.error.connect(lambda msg: err_container.append(msg))
@@ -267,8 +259,6 @@ def _run_export(func: Any, **kwargs: Any) -> None:
     active_progress: Progress | None = None
 
     def proxy_wrapper(iterable: Any, description: str | None = None) -> Any:
-        import time
-
         if description is None:
             out = kwargs.get("output_path")
             description = (
@@ -303,7 +293,7 @@ def _run_export(func: Any, **kwargs: Any) -> None:
     kwargs["progress_wrapper"] = proxy_wrapper
 
     with console.status("[bold green]Loading metadata..."):
-        thread = threading.Thread(target=func, kwargs=kwargs)
+        thread = threading.Thread(target=batch_export_tiff, kwargs=kwargs)
         thread.start()
 
         # Transition to progress bar UI as soon as we have any progress

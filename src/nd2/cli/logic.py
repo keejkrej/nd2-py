@@ -5,6 +5,8 @@ import os
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import yaml
+from tifffile import imwrite
 
 import nd2
 
@@ -45,8 +47,6 @@ def build_ome_metadata(nd2_attrs: Any, source_filename: str) -> dict[str, Any]:
 
 def write_tiff(output_path: str, data_5d: np.ndarray, metadata: dict[str, Any]) -> None:
     """Write 5D data to OME-TIFF."""
-    from tifffile import imwrite
-
     t, p, c, y, x = data_5d.shape
     data_to_write = data_5d.reshape((t, p * c, y, x))
     tiff_metadata = metadata.copy()
@@ -95,15 +95,12 @@ def _export_nd2_to_tiff(
     z: tuple[int, int] | None = None,
     signals: ND2Signals | None = None,
     progress_wrapper: Callable[[Iterable], Iterable] | None = None,
-    base_progress: int = 0,
-    progress_scale: float = 1.0,
 ) -> str:
     """Internal function to export an open ND2 file to TIFF."""
     _signals = signals or ND2Signals()
 
     def emit_progress(val: int) -> None:
-        scaled_val = base_progress + int(val * progress_scale)
-        _signals.progress.emit(scaled_val)
+        _signals.progress.emit(val)
 
     emit_progress(10)
     my_array = f.to_xarray(delayed=True)
@@ -194,29 +191,17 @@ def export_tiff(
 
 
 def load_export_config(config_path: str) -> dict[str, Any]:
-    """Load export configuration from YAML or JSON."""
+    """Load export configuration from YAML."""
     config_path = os.path.expanduser(config_path)
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     ext = os.path.splitext(config_path)[1].lower()
     if ext in (".yaml", ".yml"):
-        try:
-            import yaml
-        except ImportError:
-            raise ImportError(
-                "PyYAML is required to load YAML configs. "
-                "Install it with: pip install PyYAML"
-            ) from None
         with open(config_path) as f:
             return yaml.safe_load(f)
-    elif ext == ".json":
-        import json
-
-        with open(config_path) as f:
-            return json.load(f)
     else:
-        raise ValueError(f"Unsupported config format: {ext}. Use YAML or JSON.")
+        raise ValueError(f"Unsupported config format: {ext}. Use YAML (.yaml or .yml).")
 
 
 def batch_export_tiff(
@@ -238,41 +223,34 @@ def batch_export_tiff(
         return
 
     try:
-        with nd2.ND2File(nd2_path) as f:
-            for i, task in enumerate(tasks):
-                out_name = task.get("output")
-                if not out_name:
-                    raise ValueError(f"Export task {i} missing 'output' name.")
+        for i, task in enumerate(tasks):
+            out_name = task.get("output")
+            if not out_name:
+                raise ValueError(f"Export task {i} missing 'output' name.")
 
-                out_path = os.path.expanduser(os.path.join(output_dir, out_name))
-                os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            out_path = os.path.expanduser(os.path.join(output_dir, out_name))
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
-                # Wrap progress_wrapper if provided to include task description
-                task_wrapper: Any = None
-                if progress_wrapper is not None:
-                    pw = progress_wrapper
-                    name = out_name
-                    task_wrapper = lambda it: pw(it, f"Exporting {name}...")
+            # Wrap progress_wrapper if provided to include task description
+            task_wrapper: Any = None
+            if progress_wrapper is not None:
 
-                # Scale progress for each task: (i/len)*100 to ((i+1)/len)*100
-                base = int((i / len(tasks)) * 100)
-                scale = 1.0 / len(tasks)
+                def task_wrapper(it, pw=progress_wrapper, name=out_name):
+                    return pw(it, f"Exporting {name}...")
 
-                _export_nd2_to_tiff(
-                    f,
-                    out_path,
-                    position=parse_range(task.get("pos")),
-                    channel=parse_range(task.get("chan")),
-                    time=parse_range(task.get("time")),
-                    z=parse_range(task.get("z")),
-                    signals=_signals,
-                    progress_wrapper=task_wrapper,
-                    base_progress=base,
-                    progress_scale=scale,
-                )
+            export_tiff(
+                nd2_path=nd2_path,
+                output_path=out_path,
+                position=parse_range(task.get("pos")),
+                channel=parse_range(task.get("chan")),
+                time=parse_range(task.get("time")),
+                z=parse_range(task.get("z")),
+                signals=_signals,
+                progress_wrapper=task_wrapper,
+            )
 
-            _signals.progress.emit(100)
-            _signals.finished.emit([t.get("output") for t in tasks])
+        _signals.progress.emit(100)
+        _signals.finished.emit([t.get("output") for t in tasks])
     except Exception as e:
         logger.exception(f"Error during batch export: {e}")
         _signals.error.emit(str(e))
